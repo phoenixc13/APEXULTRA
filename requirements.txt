@@ -1,0 +1,7 @@
+# APEX Middleware v6 — dependências para deploy no Streamlit Cloud
+# Versões fixadas para reprodutibilidade do build
+
+streamlit==1.39.0
+numpy==2.1.3
+pandas==2.2.3
+plotly==5.24.1
