@@ -1,3 +1,246 @@
+import streamlit as st
+from pathlib import Path
+import time
+
+# imports auxiliares
+from helpers import auth, devices, chat, marketplace, simulation
+
+# tentativas seguras de import de módulos existentes
+try:
+    import apex_engine
+except Exception:
+    apex_engine = None
+
+try:
+    import apex_middleware_v6
+except Exception:
+    apex_middleware_v6 = None
+
+
+def inject_css(highlight="#ffffff"):
+    css = f"""
+    <style>
+    :root {{ --bg: #0a0a0a; --fg: #ffffff; --border: #333333; --highlight: {highlight}; }}
+    body {{ background-color: var(--bg); color: var(--fg); }}
+    .stApp {{ background-color: var(--bg); color: var(--fg); }}
+    .css-1d391kg {{ background-color: var(--bg); }}
+    .stButton>button {{ background-color: transparent; color: var(--fg); border: 1px solid var(--border); }}
+    .stTextInput>div>div>input, .stTextArea>div>div>textarea {{ background:#111111; color:var(--fg); border:1px solid var(--border); }}
+    .card {{ border:1px solid var(--border); padding:12px; border-radius:8px; background: #0f0f0f; color:var(--fg); }}
+    a {{ color: var(--highlight); }}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+
+def init_state():
+    if "logged_in" not in st.session_state:
+        st.session_state["logged_in"] = False
+    if "user_email" not in st.session_state:
+        st.session_state["user_email"] = None
+    if "theme_highlight" not in st.session_state:
+        st.session_state["theme_highlight"] = "#ffffff"
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []
+    if "chat_input" not in st.session_state:
+        st.session_state["chat_input"] = ""
+    if "selected_device" not in st.session_state:
+        st.session_state["selected_device"] = None
+
+
+def landing_page():
+    st.title("APEX ULTRA")
+    st.subheader("Middleware de Robótica com IA")
+    st.write("""<div class='card'><h3>Dispositivos Conectados</h3><p>Gerencie e monitore seus robôs.</p></div>
+    <div class='card'><h3>Chat IA</h3><p>Interaja com modelos otimizados para robótica.</p></div>
+    <div class='card'><h3>Marketplace</h3><p>Instale frameworks e ferramentas.</p></div>
+    """, unsafe_allow_html=True)
+    st.write("")
+    if st.button("Entrar"):
+        st.session_state.page = "🔐 Login / Conta"
+
+    st.write("---")
+    st.caption(f"Versão: 1.0 — GitHub: https://github.com/phoenixc13/APEXULTRA")
+
+
+def login_page():
+    st.header("Entrar / Criar conta")
+    email = st.text_input("Email")
+    password = st.text_input("Senha", type="password")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Entrar"):
+            res = auth.login(email, password)
+            if res.get("ok"):
+                st.session_state["logged_in"] = True
+                st.session_state["user_email"] = res.get("email")
+                st.success("Logado com sucesso")
+                st.experimental_rerun()
+            else:
+                st.error(res.get("error", "Erro ao logar"))
+    with col2:
+        if st.button("Criar conta"):
+            st.info("Criação de conta via Supabase (se configurado)")
+
+
+def require_login(page_func):
+    def wrapper():
+        if not st.session_state.get("logged_in"):
+            st.warning("A página requer login. Faça login para continuar.")
+            if st.button("Ir para Login"):
+                st.session_state.page = "🔐 Login / Conta"
+            return
+        return page_func()
+    return wrapper
+
+
+@require_login
+def devices_page():
+    st.header("🤖 Dispositivos")
+    devices.ensure_devices()
+    st.button("+ Adicionar dispositivo", key="add_dev_btn")
+    if st.session_state.get("add_dev_btn"):
+        with st.form("add_device_form"):
+            name = st.text_input("Nome do dispositivo")
+            endpoint = st.text_input("Endpoint URL / Porta serial")
+            conn_type = st.selectbox("Tipo de conexão", ["ROS2", "API", "USB"])
+            submitted = st.form_submit_button("Adicionar")
+            if submitted:
+                devices.add_device(name, endpoint, conn_type)
+                st.success("Dispositivo adicionado")
+
+    st.write("### Lista de Dispositivos")
+    devices.render_devices()
+    if st.button("Simular ping/latência (3 atualizações)"):
+        devices.simulate_realtime(update_seconds=1, cycles=3)
+
+
+@require_login
+def chat_page():
+    st.header("🧠 Chat IA")
+    st.info("Cole sua API key ou use APEX AI (Pro)")
+    use_my_key = st.checkbox("Usar minha API key")
+    provider = st.selectbox("Provedor", ["openai", "anthropic"]) if use_my_key else st.selectbox("Provedor (APEX)", ["nvidia_nim"])
+    api_key = st.text_input("API Key", type="password") if use_my_key else None
+    apex_toggle = not use_my_key
+
+    # voice component
+    voice_html = """
+    <div class='card'>
+    <button id='start'>🎙️ Iniciar gravação</button>
+    <p id='status'></p>
+    <script>
+    const start = document.getElementById('start')
+    start.onclick = async ()=>{
+      const r = window.speechSynthesis || null
+      try{
+        const recognition = new(window.webkitSpeechRecognition || window.SpeechRecognition)();
+        recognition.lang = 'pt-BR';
+        recognition.onresult = (e)=>{
+          const text = e.results[0][0].transcript;
+          const msg = {isStreamlitMessage:true, type:'streamlit:setComponentValue', value:text}
+          window.parent.postMessage(msg, '*')
+        }
+        recognition.start();
+      }catch(e){document.getElementById('status').innerText='Navegador não suportado.'}
+    }
+    </script>
+    </div>
+    """
+    voice_val = st.components.v1.html(voice_html, height=120)
+    # show messages
+    chat.ensure_messages()
+    for m in st.session_state.messages:
+        role = m.get('role')
+        content = m.get('content')
+        if role == 'system':
+            continue
+        with st.chat_message(role if role in ['user','assistant'] else 'user'):
+            st.write(content)
+
+    st.text_input("Mensagem", key="chat_input", placeholder="Digite sua mensagem...")
+    if st.button("Enviar"):
+        resp = chat.send_message(use_apex_ai=apex_toggle, provider=provider, api_key=api_key, model=None)
+        if resp is not None:
+            st.success("Resposta recebida")
+
+
+@require_login
+def middleware_page():
+    st.header("⚙️ API Middleware")
+    st.write("Cole sua API de IA e receba um endpoint APEX otimizado para robótica")
+    with st.form("middleware_form"):
+        project = st.text_input("Nome do projeto")
+        api_key = st.text_input("API Key")
+        model = st.text_input("Modelo desejado", value="gpt-4o-mini")
+        submitted = st.form_submit_button("Gerar endpoint")
+        if submitted:
+            proj_id = project.lower().replace(" ", "-") or "proj"
+            endpoint = f"https://apex.api/v1/{proj_id}/chat"
+            st.success("Endpoint gerado")
+            st.code(endpoint)
+            st.write("Exemplo curl:")
+            st.code(f"curl -X POST {endpoint} -H 'Authorization: Bearer {api_key}' -d '{{\"input\":\"Hello\"}}'", language="bash")
+            st.write("Exemplo Python:")
+            st.code("""import requests
+resp = requests.post('%s', headers={'Authorization':'Bearer %s'}, json={'input':'Hello'})
+print(resp.json())""" % (endpoint, api_key), language="python")
+
+    st.write("### APIs conectadas")
+    st.write("(Não persistido nesta demo — apenas UI)")
+
+
+@require_login
+def marketplace_page():
+    st.header("🛒 Marketplace")
+    marketplace.render_marketplace()
+
+
+def simulation_page():
+    st.header("🔬 Simulação")
+    simulation.run_simulation_ui()
+
+
+def main():
+    st.set_page_config(page_title="APEX ULTRA", layout="wide")
+    init_state()
+
+    highlight_choice = st.sidebar.selectbox("Cor de destaque", ["#ffffff", "#bdbdbd", "#00ff00", "#ffbf00"], format_func=lambda v: {'#ffffff':'Branco','#bdbdbd':'Cinza','#00ff00':'Verde terminal','#ffbf00':'Amber'}[v])
+    st.session_state.theme_highlight = highlight_choice
+    inject_css(highlight=st.session_state.theme_highlight)
+
+    menu = ["🏠 Home", "🔐 Login / Conta", "🤖 Dispositivos", "🧠 Chat IA", "⚙️ API Middleware", "🛒 Marketplace", "🔬 Simulação"]
+    if "page" not in st.session_state:
+        st.session_state.page = menu[0]
+
+    page = st.sidebar.radio("Navegação", menu, index=menu.index(st.session_state.page))
+    st.session_state.page = page
+
+    # enforce auth for restricted pages
+    restricted = ["🤖 Dispositivos", "🧠 Chat IA", "⚙️ API Middleware", "🛒 Marketplace", "🔬 Simulação"]
+    if page in restricted and not st.session_state.get("logged_in"):
+        st.warning("A página requer autenticação — redirecionando para Login")
+        st.session_state.page = "🔐 Login / Conta"
+        page = st.session_state.page
+
+    if page == "🏠 Home":
+        landing_page()
+    elif page == "🔐 Login / Conta":
+        login_page()
+    elif page == "🤖 Dispositivos":
+        devices_page()
+    elif page == "🧠 Chat IA":
+        chat_page()
+    elif page == "⚙️ API Middleware":
+        middleware_page()
+    elif page == "🛒 Marketplace":
+        marketplace_page()
+    elif page == "🔬 Simulação":
+        simulation_page()
+
+
+if __name__ == '__main__':
+    main()
 """
 APEX Middleware v6 — Dashboard Web (Streamlit)
 
